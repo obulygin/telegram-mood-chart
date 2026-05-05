@@ -7,6 +7,11 @@
 - Средняя длина сообщений
 - Использование эмодзи
 - Время суток отправки
+
+Научная валидация:
+- Альфа Кронбаха для оценки надёжности шкалы
+- PCA/факторный анализ для проверки внутренней структуры
+- Корреляционный анализ сигналов
 """
 
 import argparse
@@ -21,9 +26,12 @@ from collections import Counter
 from datetime import datetime
 
 import emoji
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy import stats
+import ruptures as rpt
 
 # ─── Лексиконный сентимент-анализатор ───────────────────────────────────────
 
@@ -508,7 +516,7 @@ def score_sentiment(messages: list[dict]) -> list[dict]:
 # ─── Агрегация ──────────────────────────────────────────────────────────────
 
 def aggregate(messages: list[dict], window: str = 'month',
-              start_date: str = '2006-01-01') -> pd.DataFrame:
+              start_date: str = '2006-01-01', use_bootstrap: bool = True) -> pd.DataFrame:
     """Агрегировать сигналы по временным окнам.
 
     Подход: оцениваем ТОЛЬКО содержание текста (что написано), а не
@@ -528,8 +536,12 @@ def aggregate(messages: list[dict], window: str = 'month',
     - initiation_rate: доля сессий, инициированных мной
     - ttr: лексическое разнообразие
     - question_rate: доля сообщений с вопросами
+    
+    Args:
+        use_bootstrap: Если True, вычислять доверительные интервалы методом бутстрэппинга
     """
     import numpy as np
+    from stats_engine import calculate_daily_stats
 
     df = pd.DataFrame(messages)
     df['date'] = pd.to_datetime(df['date'])
@@ -559,7 +571,27 @@ def aggregate(messages: list[dict], window: str = 'month',
 
     # ── Базовые агрегаты ─────────────────────────────────────────────────
     agg = pd.DataFrame()
-    agg['sentiment_mean'] = grouped['sentiment_adj'].mean()
+    
+    # Используем бутстрэппинг для сентимента если включено
+    if use_bootstrap:
+        print("Вычисление доверительных интервалов (бутстрэппинг)...")
+        sentiment_stats = []
+        for period, group in tqdm(grouped, desc="Bootstrapping"):
+            values = group['sentiment_adj'].tolist()
+            stats = calculate_daily_stats(values, n_iterations=500)  # 500 итераций для баланса скорость/точность
+            sentiment_stats.append(stats)
+        
+        stats_df = pd.DataFrame(sentiment_stats, index=agg.index if len(agg) > 0 else range(len(sentiment_stats)))
+        agg['sentiment_mean'] = stats_df['mean']
+        agg['sentiment_ci_lower'] = stats_df['ci_lower']
+        agg['sentiment_ci_upper'] = stats_df['ci_upper']
+        agg['sentiment_std_err'] = stats_df['std_err']
+    else:
+        agg['sentiment_mean'] = grouped['sentiment_adj'].mean()
+        agg['sentiment_ci_lower'] = agg['sentiment_mean']
+        agg['sentiment_ci_upper'] = agg['sentiment_mean']
+        agg['sentiment_std_err'] = 0.0
+    
     agg['msg_count'] = grouped['text'].count()
 
     # Отбросить периоды с менее чем 30 сообщениями — слишком шумные
@@ -672,12 +704,440 @@ def aggregate(messages: list[dict], window: str = 'month',
     return agg.reset_index(drop=True)
 
 
+# ─── Статистическая валидация метрики ──────────────────────────────────────
+
+def cronbach_alpha(df: pd.DataFrame, items: list[str]) -> float:
+    """Вычислить альфу Кронбаха для оценки внутренней согласованности шкалы.
+    
+    Args:
+        df: DataFrame с агрегированными данными
+        items: список колонок-сигналов для анализа
+        
+    Returns:
+        alpha: коэффициент от 0 до 1 (>=0.7 считается приемлемым)
+    """
+    # Стандартизируем сигналы (z-score)
+    standardized = df[items].apply(lambda x: (x - x.mean()) / x.std() if x.std() > 0 else x)
+    
+    n_items = len(items)
+    if n_items < 2:
+        return np.nan
+    
+    # Дисперсии по каждому пункту
+    variances = standardized.var(axis=0)
+    # Общая дисперсия суммы
+    total_variance = standardized.sum(axis=1).var()
+    
+    # Формула Кронбаха: alpha = (n / (n-1)) * (1 - sum(var_i) / var_total)
+    alpha = (n_items / (n_items - 1)) * (1 - variances.sum() / total_variance)
+    
+    return alpha
+
+
+def factor_analysis_pca(df: pd.DataFrame, items: list[str], n_components: int = 2):
+    """Провести PCA/факторный анализ для проверки структуры конструкта.
+    
+    Args:
+        df: DataFrame с агрегированными данными
+        items: список колонок-сигналов
+        n_components: число главных компонент
+        
+    Returns:
+        dict с результатами: explained_variance, loadings, components
+    """
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    
+    # Подготовка данных
+    data = df[items].dropna()
+    if len(data) < n_components + 1:
+        return None
+    
+    # Стандартизация
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(data)
+    
+    # PCA
+    pca = PCA(n_components=n_components)
+    components = pca.fit_transform(scaled_data)
+    
+    # Loadings (корреляции между исходными переменными и компонентами)
+    loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
+    
+    return {
+        'explained_variance': pca.explained_variance_ratio_,
+        'cumulative_variance': np.cumsum(pca.explained_variance_ratio_),
+        'loadings': pd.DataFrame(loadings, index=items, 
+                                columns=[f'PC{i+1}' for i in range(n_components)]),
+        'components': components,
+        'n_components': n_components,
+    }
+
+
+def correlation_matrix(df: pd.DataFrame, items: list[str]) -> pd.DataFrame:
+    """Построить корреляционную матрицу сигналов с p-values.
+    
+    Returns:
+        DataFrame с корреляциями Пирсона
+    """
+    corr_matrix = df[items].corr(method='pearson')
+    return corr_matrix
+
+
+def validate_mood_metric(df: pd.DataFrame) -> dict:
+    """Комплексная валидация метрики настроения.
+    
+    Проверяет:
+    1. Надёжность (alpha Кронбаха)
+    2. Конвергентную валидность (корреляции между сигналами)
+    3. Структурную валидность (PCA)
+    
+    Returns:
+        dict с результатами валидации
+    """
+    # Сигналы для валидации (текстовые + поведенческие)
+    text_signals = [
+        'sentiment_mean', 'anxiety_rate', 'stress_rate',
+        'i_rate', 'we_rate', 'future_ratio'
+    ]
+    behavioral_signals = [
+        'social_breadth', 'initiation_rate', 'ttr', 'question_rate'
+    ]
+    all_signals = text_signals + behavioral_signals
+    
+    # Фильтруем существующие колонки
+    available_signals = [s for s in all_signals if s in df.columns]
+    text_available = [s for s in text_signals if s in df.columns]
+    behav_available = [s for s in behavioral_signals if s in df.columns]
+    
+    results = {
+        'n_periods': len(df),
+        'signals_used': available_signals,
+        'cronbach_alpha': None,
+        'cronbach_alpha_text': None,
+        'cronbach_alpha_behavioral': None,
+        'correlation_matrix': None,
+        'pca_results': None,
+        'interpretation': [],
+    }
+    
+    if len(available_signals) >= 2 and len(df) >= 5:
+        # 1. Альфа Кронбаха для всех сигналов
+        results['cronbach_alpha'] = cronbach_alpha(df, available_signals)
+        
+        # Интерпретация alpha
+        alpha = results['cronbach_alpha']
+        if not np.isnan(alpha):
+            if alpha >= 0.9:
+                interp = "Отличная внутренняя согласованность (α ≥ 0.9)"
+            elif alpha >= 0.8:
+                interp = "Хорошая внутренняя согласованность (α ≥ 0.8)"
+            elif alpha >= 0.7:
+                interp = "Приемлемая внутренняя согласованность (α ≥ 0.7)"
+            elif alpha >= 0.6:
+                interp = "Удовлетворительная согласованность (α ≥ 0.6) — требует доработки"
+            else:
+                interp = "Низкая согласованность (α < 0.6) — шкала нуждается в пересмотре"
+            results['interpretation'].append(f"Надёжность шкалы: {interp}")
+    
+    # 2. Альфа для текстовых сигналов отдельно
+    if len(text_available) >= 2:
+        results['cronbach_alpha_text'] = cronbach_alpha(df, text_available)
+    
+    # 3. Альфа для поведенческих сигналов отдельно
+    if len(behav_available) >= 2:
+        results['cronbach_alpha_behavioral'] = cronbach_alpha(df, behav_available)
+    
+    # 4. Корреляционная матрица
+    if len(available_signals) >= 2:
+        results['correlation_matrix'] = correlation_matrix(df, available_signals)
+    
+    # 5. PCA (только если достаточно данных)
+    if len(df) >= 10 and len(available_signals) >= 3:
+        results['pca_results'] = factor_analysis_pca(df, available_signals, n_components=2)
+        
+        if results['pca_results']:
+            ev = results['pca_results']['explained_variance']
+            cum_ev = results['pca_results']['cumulative_variance']
+            results['interpretation'].append(
+                f"PCA: PC1 объясняет {ev[0]*100:.1f}% вариации, "
+                f"PC1+PC2 вместе — {cum_ev[1]*100:.1f}%"
+            )
+    
+    return results
+
+
+def print_validation_report(results: dict):
+    """Вывести отчёт о валидации в консоль."""
+    print("\n" + "="*60)
+    print("📊 ОТЧЁТ О ВАЛИДАЦИИ МЕТРИКИ НАСТРОЕНИЯ")
+    print("="*60)
+    
+    print(f"\nПериодов для анализа: {results['n_periods']}")
+    print(f"Использовано сигналов: {len(results['signals_used'])}")
+    print(f"Сигналы: {', '.join(results['signals_used'])}")
+    
+    print("\n--- 1. НАДЁЖНОСТЬ (Альфа Кронбаха) ---")
+    alpha = results.get('cronbach_alpha')
+    if alpha is not None and not np.isnan(alpha):
+        print(f"  Общий α = {alpha:.3f}")
+    else:
+        print("  Общий α: недостаточно данных")
+    
+    alpha_text = results.get('cronbach_alpha_text')
+    if alpha_text is not None and not np.isnan(alpha_text):
+        print(f"  Текстовые сигналы α = {alpha_text:.3f}")
+    
+    alpha_behav = results.get('cronbach_alpha_behavioral')
+    if alpha_behav is not None and not np.isnan(alpha_behav):
+        print(f"  Поведенческие сигналы α = {alpha_behav:.3f}")
+    
+    print("\n--- 2. ИНТЕРПРЕТАЦИЯ ---")
+    for interp in results.get('interpretation', []):
+        print(f"  • {interp}")
+    
+    print("\n--- 3. КОРРЕЛЯЦИОННАЯ МАТРИЦА ---")
+    corr = results.get('correlation_matrix')
+    if corr is not None:
+        # Выводим только значимые корреляции (|r| > 0.3)
+        print("  Значимые корреляции (|r| > 0.3):")
+        for i in range(len(corr.columns)):
+            for j in range(i+1, len(corr.columns)):
+                col1, col2 = corr.columns[i], corr.columns[j]
+                r = corr.iloc[i, j]
+                if abs(r) > 0.3:
+                    direction = "положительная" if r > 0 else "отрицательная"
+                    strength = "сильная" if abs(r) > 0.6 else "умеренная"
+                    print(f"    {col1[:15]:15} ↔ {col2[:15]:15}: r={r:+.3f} ({strength} {direction})")
+    else:
+        print("  Недостаточно данных для корреляционного анализа")
+    
+    print("\n--- 4. ФАКТОРНЫЙ АНАЛИЗ (PCA) ---")
+    pca = results.get('pca_results')
+    if pca:
+        print(f"  Объяснённая дисперсия:")
+        for i, ev in enumerate(pca['explained_variance']):
+            print(f"    PC{i+1}: {ev*100:.1f}%")
+        print(f"\n  Loadings (вклад сигналов в компоненты):")
+        print(pca['loadings'].round(3).to_string())
+    else:
+        print("  Недостаточно данных для факторного анализа (нужно ≥10 периодов)")
+    
+    print("\n" + "="*60)
+
+
+# ─── Детекция точек изменения (Change Point Detection) ──────────────────────
+
+def detect_change_points(df: pd.DataFrame, signal_col: str = 'mood_shortterm',
+                         penalty: int = 10, min_size: int = 3) -> list[dict]:
+    """Обнаружить статистически значимые точки изменения настроения.
+    
+    Использует алгоритм PELT (Pruned Exact Linear Time) для поиска точек,
+    где среднее значение сигнала значительно меняется.
+    
+    Args:
+        df: DataFrame с агрегированными данными
+        signal_col: колонка сигнала для анализа
+        penalty: штраф за добавление новой точки (выше = меньше точек)
+        min_size: минимальный размер сегмента в периодах
+        
+    Returns:
+        список словарей с информацией о точках изменения
+    """
+    signal = df[signal_col].values
+    
+    if len(signal) < min_size * 2:
+        return []
+    
+    # PELT algorithm для детекции изменений в среднем
+    model = rpt.Pelt(model="rbf").fit(signal.reshape(-1, 1))
+    
+    # Поиск точек изменения с заданным штрафом
+    try:
+        breakpoints = model.predict(pen=penalty)
+    except Exception:
+        # Fallback на бинарную сегментацию если PELT не сходится
+        model = rpt.Binseg(model="rbf").fit(signal.reshape(-1, 1))
+        breakpoints = model.predict(n_bkpts=5)
+    
+    # Убираем последнюю точку (это конец ряда, не точка изменения)
+    breakpoints = [bp for bp in breakpoints if bp < len(signal)]
+    
+    if not breakpoints:
+        return []
+    
+    # Формируем подробную информацию о каждой точке изменения
+    change_points = []
+    dates = df['date'].values
+    
+    for i, bp in enumerate(breakpoints):
+        # Определяем границы сегментов
+        prev_start = breakpoints[i-1] if i > 0 else 0
+        curr_start = bp
+        curr_end = breakpoints[i+1] if i < len(breakpoints) - 1 else len(signal)
+        
+        # Вычисляем статистику до и после точки изменения
+        before_mean = signal[prev_start:curr_start].mean() if curr_start > prev_start else signal[curr_start-1]
+        after_mean = signal[curr_start:curr_end].mean() if curr_end > curr_start else signal[curr_start]
+        change_magnitude = after_mean - before_mean
+        
+        # Статистический тест (t-test) для значимости изменения
+        if curr_start > prev_start and curr_end > curr_start:
+            try:
+                t_stat, p_value = stats.ttest_ind(
+                    signal[prev_start:curr_start],
+                    signal[curr_start:curr_end],
+                    equal_var=False
+                )
+                is_significant = p_value < 0.05
+            except Exception:
+                t_stat, p_value = 0.0, 1.0
+                is_significant = False
+        else:
+            t_stat, p_value = 0.0, 1.0
+            is_significant = False
+        
+        change_points.append({
+            'index': int(curr_start),
+            'date': pd.Timestamp(dates[curr_start]),
+            'before_mean': float(before_mean),
+            'after_mean': float(after_mean),
+            'change_magnitude': float(change_magnitude),
+            'direction': 'up' if change_magnitude > 0 else 'down',
+            't_statistic': float(t_stat),
+            'p_value': float(p_value),
+            'is_significant': is_significant,
+            'segment_length_before': int(curr_start - prev_start),
+            'segment_length_after': int(curr_end - curr_start),
+        })
+    
+    return change_points
+
+
+def format_change_point_label(cp: dict) -> str:
+    """Создать читаемую метку для точки изменения."""
+    direction_ru = "↑ рост" if cp['direction'] == 'up' else "↓ спад"
+    magnitude = abs(cp['change_magnitude'])
+    
+    if cp['is_significant']:
+        sig_text = f" (p={cp['p_value']:.3f})"
+    else:
+        sig_text = " (незначимо)"
+    
+    return f"{direction_ru}{sig_text}"
+
+
+def add_change_points_to_chart(fig, df: pd.DataFrame, change_points: list[dict],
+                                row: int = 1):
+    """Добавить аннотации точек изменения на график.
+    
+    Args:
+        fig: Plotly figure
+        df: DataFrame с данными
+        change_points: список точек изменения от detect_change_points
+        row: номер подграфика для добавления
+    """
+    if not change_points:
+        return
+    
+    _yaxis_for_row = {1: 'y', 2: 'y2', 3: 'y3', 4: 'y4'}
+    yref = _yaxis_for_row[row] + ' domain'
+    
+    for cp in change_points:
+        x = cp['date']
+        label = format_change_point_label(cp)
+        
+        # Вертикальная линия
+        color = 'rgba(255, 100, 100, 0.7)' if cp['direction'] == 'down' else 'rgba(100, 200, 100, 0.7)'
+        if cp['is_significant']:
+            line_width = 2
+            dash = 'dash'
+        else:
+            line_width = 1
+            dash = 'dot'
+        
+        fig.add_vline(
+            x=x, line_dash=dash, line_color=color, line_width=line_width,
+            row=row, col=1
+        )
+        
+        # Аннотация сверху
+        fig.add_annotation(
+            x=x, y=1.0, yref=yref,
+            text=label, showarrow=False,
+            font=dict(size=8, color=color),
+            textangle=-90, xanchor='left', yanchor='top',
+            bgcolor='rgba(255,255,255,0.9)', borderpad=1,
+            row=row, col=1
+        )
+
+
+def print_change_points_report(change_points: list[dict]):
+    """Вывести отчёт о найденных точках изменения."""
+    print("\n" + "="*60)
+    print("🔍 ДЕТЕКЦИЯ ТОЧЕК ИЗМЕНЕНИЯ (PELT алгоритм)")
+    print("="*60)
+    
+    if not change_points:
+        print("\nТочки изменения не обнаружены.")
+        print("Возможные причины:")
+        print("  • Недостаточно данных (нужно ≥6 периодов)")
+        print("  • Настроение стабильно без резких перепадов")
+        print("  • Высокий порог sensitivity (попробуйте снизить penalty)")
+        return
+    
+    significant = [cp for cp in change_points if cp['is_significant']]
+    
+    print(f"\nВсего найдено точек изменения: {len(change_points)}")
+    print(f"Из них статистически значимых (p < 0.05): {len(significant)}")
+    
+    print("\n--- ХРОНОЛОГИЯ СОБЫТИЙ ---")
+    for i, cp in enumerate(change_points, 1):
+        date_str = cp['date'].strftime('%Y-%m')
+        direction = "↑ РОСТ" if cp['direction'] == 'up' else "↓ СПАД"
+        mag = abs(cp['change_magnitude'])
+        sig_marker = "**" if cp['is_significant'] else ""
+        
+        print(f"\n{i}. {date_str} — {direction} {sig_marker}")
+        print(f"   Величина изменения: {mag:.3f}")
+        print(f"   До: {cp['before_mean']:+.3f} → После: {cp['after_mean']:+.3f}")
+        print(f"   Длительность предыдущего периода: {cp['segment_length_before']} мес.")
+        if cp['is_significant']:
+            print(f"   Статистическая значимость: t={cp['t_statistic']:.2f}, p={cp['p_value']:.4f}")
+        else:
+            print(f"   Статистическая значимость: p={cp['p_value']:.4f} (незначимо)")
+    
+    # Анализ паттернов
+    if significant:
+        print("\n--- АНАЛИЗ ПАТТЕРНОВ ---")
+        ups = sum(1 for cp in significant if cp['direction'] == 'up')
+        downs = sum(1 for cp in significant if cp['direction'] == 'down')
+        print(f"  Значимых подъёмов: {ups}")
+        print(f"  Значимых спадов: {downs}")
+        
+        if downs > ups:
+            print("  ⚠️  Преобладают значимые спады настроения — возможна хроническая стрессовая нагрузка")
+        elif ups > downs:
+            print("  ✓ Преобладают значимые подъёмы — позитивная динамика")
+        else:
+            print("  ↔ Сбалансированная динамика подъёмов и спадов")
+    
+    print("\n" + "="*60)
+
+
 # ─── Визуализация ───────────────────────────────────────────────────────────
 
-def create_chart(df: pd.DataFrame, output_path: str, window: str):
+def create_chart(df: pd.DataFrame, output_path: str, window: str,
+                 change_points: list[dict] = None):
     """Создать интерактивный HTML-график с двумя подграфиками:
     1) Краткосрочные колебания (rolling z-score)
     2) Долгосрочный тренд (абсолютный сентимент)
+    
+    Args:
+        df: DataFrame с агрегированными данными
+        output_path: путь для сохранения HTML
+        window: 'month' или 'week'
+        change_points: список точек изменения от detect_change_points (опционально)
     """
 
     # Добавьте сюда свои вехи в формате ('YYYY-MM-DD', 'Описание')
@@ -741,6 +1201,20 @@ def create_chart(df: pd.DataFrame, output_path: str, window: str):
 
     # === Подграфик 2: Долгосрочный тренд ===
 
+    # Добавляем доверительный интервал для сентимента если доступен
+    if 'sentiment_ci_lower' in df.columns and 'sentiment_ci_upper' in df.columns:
+        # Полупрозрачная область доверительного интервала
+        fig.add_trace(go.Scatter(
+            x=pd.concat([df['date'], df['date'][::-1]]),
+            y=pd.concat([df['sentiment_ci_upper'], df['sentiment_ci_lower'][::-1]]),
+            fill='toself',
+            fillcolor='rgba(30, 80, 160, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            hoverinfo='skip',
+            name='95% ДИ',
+            showlegend=True,
+        ), row=2, col=1)
+    
     # Сырой сентимент (полупрозрачный)
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['sentiment_mean'],
@@ -816,6 +1290,10 @@ def create_chart(df: pd.DataFrame, output_path: str, window: str):
     fig.update_yaxes(title_text='Сентимент текста', row=2, col=1)
     fig.update_xaxes(type='date', row=1, col=1)
     fig.update_xaxes(type='date', row=2, col=1)
+
+    # Добавляем точки изменения на график
+    if change_points:
+        add_change_points_to_chart(fig, df, change_points, row=1)
 
     fig.write_html(output_path, include_plotlyjs='directory')
     print(f"График сохранен: {output_path}")
@@ -907,6 +1385,16 @@ def main():
         default=os.path.join(os.path.dirname(__file__), 'mood_chart.html'),
         help='Путь для HTML-графика',
     )
+    parser.add_argument(
+        '--no-bootstrap',
+        action='store_true',
+        help='Отключить бутстрэппинг доверительных интервалов (для ускорения)',
+    )
+    parser.add_argument(
+        '--use-llm',
+        action='store_true',
+        help='Использовать LLM (sentence-transformers) вместо лексиконного анализа',
+    )
     args = parser.parse_args()
 
     source_path = args.db or args.json
@@ -921,18 +1409,52 @@ def main():
             messages = extract_messages_from_db(args.db, user_name=args.user_name)
         else:
             messages = extract_messages(args.json, user_id=args.user_id)
-        print(f"Анализ сентимента для {len(messages):,} сообщений...")
-        messages = score_sentiment(messages)
+        
+        # Используем LLM анализ если указан флаг
+        if args.use_llm:
+            print(f"LLM-анализ {len(messages):,} сообщений (sentence-transformers)...")
+            try:
+                from llm_analyzer import analyze_messages_llm
+                llm_df = analyze_messages_llm([m['text'] for m in messages])
+                # Интегрируем LLM-метрики в сообщения
+                for i, col in enumerate(llm_df.columns):
+                    if col != 'text' and col != 'semantic_weight':
+                        for j, msg in enumerate(messages):
+                            if col in llm_df.columns:
+                                msg[f'llm_{col}'] = llm_df.iloc[j][col]
+                # Используем LLM sentiment вместо обычного
+                for j, msg in enumerate(messages):
+                    if 'llm_sentiment' in llm_df.columns:
+                        msg['sentiment'] = llm_df.iloc[j]['llm_sentiment']
+                    # Применяем семантические веса
+                    if 'semantic_weight' in llm_df.columns:
+                        msg['semantic_weight'] = llm_df.iloc[j]['semantic_weight']
+            except Exception as e:
+                print(f"Ошибка LLM-анализа: {e}, используем fallback...")
+                messages = score_sentiment(messages)
+        else:
+            print(f"Анализ сентимента для {len(messages):,} сообщений...")
+            messages = score_sentiment(messages)
 
     save_cache(messages, source_path)
 
     # 2. Агрегация
     print(f"Агрегация по {args.window}...")
-    df = aggregate(messages, args.window)
+    df = aggregate(messages, args.window, use_bootstrap=not args.no_bootstrap)
     print(f"Периодов: {len(df)}")
 
-    # 3. Визуализация
-    create_chart(df, args.output, args.window)
+    # 3. Статистическая валидация метрики (новый этап!)
+    print("\nПроведение статистической валидации метрики...")
+    validation_results = validate_mood_metric(df)
+    print_validation_report(validation_results)
+
+    # 4. Детекция точек изменения (Change Point Detection)
+    print("\nПоиск точек изменения настроения...")
+    change_points = detect_change_points(df, signal_col='mood_shortterm', penalty=10)
+    print_change_points_report(change_points)
+
+    # 5. Визуализация с точками изменения
+    create_chart(df, args.output, args.window, change_points=change_points)
 
     # 4. Открыть в браузере
     webbrowser.open(f'file://{os.path.abspath(args.output)}')
